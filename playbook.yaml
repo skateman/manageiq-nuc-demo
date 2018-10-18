@@ -1,0 +1,251 @@
+---
+- name: Update packages on all hosts
+  tags:
+    - yum
+  hosts:
+    - engine
+    - nodes
+  tasks:
+    - yum:
+        name: '*'
+        state: latest
+
+- name: Install oVirt engine
+  tags:
+    - ovirt-engine
+  hosts: engine
+  vars:
+    ovirt_engine_setup_version: '4.2'
+    ovirt_engine_setup_organization: 'ovirt-engine.miq'
+    ovirt_engine_setup_admin_password: '{{ ansible_password }}'
+    ovirt_repositories_ovirt_release_rpm: 'http://resources.ovirt.org/pub/yum-repo/ovirt-release42.rpm'
+    ovirt_engine_setup_use_remote_answer_file: false
+  roles:
+    - oVirt.repositories
+    - oVirt.engine-setup
+
+- name: Setup the oVirt hosts
+  tags:
+    - ovirt-nfs
+  hosts: nodes
+  tasks:
+    - name: Enable nested virtualization
+      lineinfile:
+        dest: /etc/modprobe.d/kvm.conf
+        state: present
+        create: yes
+        line: options kvm_intel nested=1
+    - name: Set up the oVirt repo
+      yum:
+        name: http://resources.ovirt.org/pub/yum-repo/ovirt-release42.rpm
+        state: present
+    - name: Install vdsm, libvirt and cockpit
+      yum:
+        name:
+          - libvirt-daemon-kvm
+          - vdsm
+          - cockpit
+        state: present
+    - name: Create NFS folders
+      file:
+        dest: /var/nfs
+        state: directory
+        owner: vdsm
+        group: kvm
+    - name: Start and enable NFS
+      systemd:
+        name: nfs
+        enabled: yes
+        state: started
+    - name: Create NFS exports
+      lineinfile:
+        dest: /etc/exports
+        line: "/var/nfs 192.168.20.0/24(rw)"
+    - name: Reload NFS server
+      service:
+        name: nfs
+        state: reloaded
+    - name: Export NFS folders
+      shell: exportfs -ra
+    - name: Enable cockpit
+      service:
+        name: cockpit
+        enabled: true
+        state: started
+    - name: Permit NFS in firewalld
+      firewalld:
+        service: "{{ item }}"
+        permanent: true
+        state: enabled
+      with_items:
+        - nfs
+        - mountd
+        - rpc-bind
+      notify:
+        - Reload firewalld
+  handlers:
+    - name: Reload firewalld
+      service:
+        name: firewalld
+        state: reloaded
+        enabled: true
+
+- name: Add oVirt hosts and set up storage
+  tags:
+    - ovirt-hosts
+  hosts: engine
+  vars:
+    engine_url: https://ovirt-engine.miq/ovirt-engine/api
+    engine_user: admin@internal
+    engine_password: '{{ ansible_password }}'
+    data_center_name: Default
+    compatibility_version: 4.2
+    hosts:
+      - name: ovirt-1
+        address: ovirt-1.miq
+        cluster: Default
+        password: '{{ engine_password }}'
+      - name: ovirt-2
+        address: ovirt-2.miq
+        cluster: Default
+        password: '{{ engine_password }}'
+    storages:
+      ovirt-1:
+        master: true
+        state: present
+        host: ovirt-1
+        nfs:
+          address: ovirt-1.miq
+          path: /var/nfs
+      ovirt-2:
+        state: present
+        host: ovirt-2
+        nfs:
+          address: ovirt-2.miq
+          path: /var/nfs
+    clusters:
+      name: Default
+      threads_as_cores: true
+  pre_tasks:
+    - name: Login to oVirt
+      ovirt_auth:
+        url: "{{ engine_url }}"
+        username: "{{ engine_user }}"
+        password: "{{ engine_password }}"
+        ca_file: "{{ engine_cafile | default(omit) }}"
+        insecure: "{{ engine_insecure | default(true) }}"
+      tags:
+        - always
+  roles:
+    - oVirt.infra
+  post_tasks:
+    - name: Logout from oVirt
+      ovirt_auth:
+        state: absent
+        ovirt_auth: "{{ ovirt_auth }}"
+      tags:
+        - always
+
+- name: Set up ManageIQ with the oVirt provider
+  tags:
+    - ovirt-manageiq
+  hosts: engine
+  vars:
+    engine_fqdn: ovirt-engine.miq
+    engine_user: admin@internal
+    engine_password: '{{ ansible_password }}'
+    miq_vm_name: gaprindashvili
+    miq_qcow_url: http://releases.manageiq.org/manageiq-ovirt-gaprindashvili-5.qc2
+    miq_vm_cluster: Default
+    miq_rhv_provider_name: ovirt-nuc
+    metrics_fqdn: ovirt-engine.miq
+    metrics_port: 5432
+    metrics_user: ovirt_engine_history
+    miq_vm_nics:
+      - name: nic1
+        profile_name: ovirtmgmt
+        interface: virtio
+        mac_address: f8:45:45:3a:12:19
+  pre_tasks:
+    - shell: cat /etc/ovirt-engine/engine.conf.d/10-setup-dwh-database.conf | grep DWH_DB_PASSWORD | sed 's/.*=\"\(.*\)\"/\1/'
+      register: metrics_password_
+    - set_fact:
+        metrics_password: "{{ metrics_password_.stdout }}"
+  roles:
+    - oVirt.manageiq
+
+- name: Import CentOS template
+  tags:
+    - centos-openshift
+  hosts: engine
+  vars:
+    engine_url: https://ovirt-engine.miq/ovirt-engine/api
+    engine_user: admin@internal
+    engine_password: '{{ ansible_password }}'
+    data_center_name: Default
+    compatibility_version: 4.2
+
+    qcow_url: https://cloud.centos.org/centos/7/images/CentOS-7-x86_64-GenericCloud.qcow2
+    template_name: centos7_template
+    template_memory: 8GiB
+    template_cpu: 2
+    template_disk_size: 40GiB
+
+    vms:
+      - name: openshift
+        profile:
+          cluster: Default
+          state: running
+          template: centos7_template
+        cloud_init:
+          host_name: openshift
+          root_password: '{{ ansible_password }}'
+        nics:
+          - name: nic1
+            profile: ovirtmgmt
+            interface: virtio
+            mac_address: 00:1a:4a:16:01:0a
+
+  pre_tasks:
+    - name: Login to oVirt
+      ovirt_auth:
+        url: "{{ engine_url }}"
+        username: "{{ engine_user }}"
+        password: "{{ engine_password }}"
+        ca_file: "{{ engine_cafile | default(omit) }}"
+        insecure: "{{ engine_insecure | default(true) }}"
+  roles:
+    - oVirt.image-template
+    - oVirt.vm-infra
+
+# - name: Deploy OpenShift
+#   tags:
+#     - openshift
+#   hosts: openshift
+#   tasks:
+#     - name: Set up the OpenShift origin repo
+#       yum:
+#         name: centos-release-openshift-origin39
+#         state: present
+#     - name: Install openshift client and docker
+#       yum:
+#         name:
+#           - origin-clients
+#           - docker
+#         state: present
+#     - name: Copy the OpenShift systemd service
+#       copy:
+#         src: openshift.service
+#         dest: /etc/systemd/system/openshift.service
+#     - name: Enable and start docker
+#       systemd:
+#         name: docker
+#         state: started
+#         enabled: yes
+#         daemon_reload: yes
+#     # docker insecure registry missing here
+#     - name: Enable and start openshift
+#       systemd:
+#         name: openshift
+#         state: started
+#         enabled: yes
